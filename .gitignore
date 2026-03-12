@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .coverage
 
+*.json
 .radist_dialogs.json
 dialogs.json
 dialogs.jsonl
