@@ -11,14 +11,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 
 DEFAULT_BASE_URL = "https://api.radist.online/v2"
+DEFAULT_ENDPOINT = "/chats"
+ENDPOINT_CANDIDATES = (
+    "/chats",
+    "/chat",
+    "/dialogs",
+    "/chats/dialogs",
+    "/chat/dialogs",
+)
 
 
 class ApiError(RuntimeError):
     """Raised when API request fails."""
+
+
+@dataclass
+class HttpStatusError(ApiError):
+    status_code: int
+    url: str
+    body: str
+
+    def __str__(self) -> str:
+        details = f"HTTP {self.status_code} for {self.url}"
+        if self.body:
+            return f"{details}: {self.body[:200]}"
+        return details
 
 
 @dataclass
@@ -38,6 +60,9 @@ class CliConfig:
     limit_param: str
     from_param: str
     to_param: str
+    auth_header: str
+    auth_prefix: str
+    token_query_param: Optional[str]
 
 
 def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
@@ -60,7 +85,7 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument(
         "--endpoint",
-        default="/chats",
+        default=DEFAULT_ENDPOINT,
         help="API endpoint path for chats (default: /chats)",
     )
     parser.add_argument("--limit", type=int, default=100, help="Page size")
@@ -78,6 +103,21 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
     parser.add_argument("--limit-param", default="limit", help="Limit query parameter name")
     parser.add_argument("--from-param", default="date_from", help="From date parameter name")
     parser.add_argument("--to-param", default="date_to", help="To date parameter name")
+    parser.add_argument(
+        "--auth-header",
+        default="Authorization",
+        help="Header name for API token (default: Authorization)",
+    )
+    parser.add_argument(
+        "--auth-prefix",
+        default="Bearer",
+        help="Prefix before token in auth header. Use empty string for raw token.",
+    )
+    parser.add_argument(
+        "--token-query-param",
+        default=None,
+        help="If set, also sends token in query param with this name (e.g. api_key)",
+    )
 
     ns = parser.parse_args(argv)
 
@@ -115,6 +155,9 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
         limit_param=ns.limit_param,
         from_param=ns.from_param,
         to_param=ns.to_param,
+        auth_header=ns.auth_header,
+        auth_prefix=ns.auth_prefix,
+        token_query_param=ns.token_query_param,
     )
 
 
@@ -139,14 +182,61 @@ def build_url(base_url: str, endpoint: str, params: Dict[str, Any]) -> str:
     return f"{base_url}{endpoint}?{query}" if query else f"{base_url}{endpoint}"
 
 
-def fetch_page(url: str, token: str, timeout: int) -> Any:
-    req = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+def build_auth_value(prefix: str, token: str) -> str:
+    normalized = prefix.strip()
+    if not normalized:
+        return token
+    return f"{normalized} {token}"
+
+
+def fetch_page(url: str, config: CliConfig) -> Any:
+    headers = {
+        config.auth_header: build_auth_value(config.auth_prefix, config.token),
+        "Accept": "application/json",
+    }
+    req = Request(url, headers=headers)
     try:
-        with urlopen(req, timeout=timeout) as resp:
+        with urlopen(req, timeout=config.timeout) as resp:
             payload = resp.read().decode("utf-8")
             return json.loads(payload)
+    except HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            body = ""
+        raise HttpStatusError(status_code=exc.code, url=url, body=body) from exc
     except Exception as exc:  # noqa: BLE001
         raise ApiError(f"Request failed for {url}: {exc}") from exc
+
+
+def resolve_endpoint(config: CliConfig) -> str:
+    if config.endpoint != DEFAULT_ENDPOINT:
+        return config.endpoint
+
+    params = {config.page_param: 1, config.limit_param: 1}
+    if config.mode == "date_range":
+        range_start, range_end = utc_range_inclusive(config.date_from or "", config.date_to or "")
+        params[config.from_param] = range_start
+        params[config.to_param] = range_end
+    if config.token_query_param:
+        params[config.token_query_param] = config.token
+
+    for endpoint in ENDPOINT_CANDIDATES:
+        url = build_url(config.base_url, endpoint, params)
+        try:
+            fetch_page(url, config)
+            return endpoint
+        except HttpStatusError as exc:
+            if exc.status_code == 404:
+                continue
+            raise
+
+    candidates = ", ".join(ENDPOINT_CANDIDATES)
+    raise ApiError(
+        "Could not auto-detect chats endpoint. "
+        f"Tried: {candidates}. Pass explicit --endpoint <path>."
+    )
 
 
 def extract_items(payload: Any) -> List[Dict[str, Any]]:
@@ -183,6 +273,7 @@ def has_next_page(payload: Any) -> Optional[bool]:
 
 def download_dialogs(config: CliConfig) -> List[Dict[str, Any]]:
     dialogs: List[Dict[str, Any]] = []
+    endpoint = resolve_endpoint(config)
     page = 1
     range_start = range_end = None
     if config.mode == "date_range":
@@ -203,9 +294,11 @@ def download_dialogs(config: CliConfig) -> List[Dict[str, Any]]:
         if config.mode == "date_range":
             params[config.from_param] = range_start
             params[config.to_param] = range_end
+        if config.token_query_param:
+            params[config.token_query_param] = config.token
 
-        url = build_url(config.base_url, config.endpoint, params)
-        payload = fetch_page(url, config.token, config.timeout)
+        url = build_url(config.base_url, endpoint, params)
+        payload = fetch_page(url, config)
         items = extract_items(payload)
         if not items:
             break

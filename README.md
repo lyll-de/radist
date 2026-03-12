@@ -36,6 +36,9 @@ python radist_dialogs.py \
 - `--base-url` базовый URL API (по умолчанию `https://api.radist.online/v2`)
 - `--limit` размер страницы (по умолчанию `100`)
 - `--timeout` таймаут HTTP (по умолчанию `30`)
+- `--auth-header` имя заголовка с токеном (по умолчанию `Authorization`)
+- `--auth-prefix` префикс токена (по умолчанию `Bearer`)
+- `--token-query-param` опционально передаёт токен ещё и в query-параметре (например `api_key`)
 
 ### Кастомизация query-параметров
 
@@ -51,3 +54,18 @@ python radist_dialogs.py \
 Так как API может возвращать данные в разных обертках, скрипт пытается извлекать диалоги из ключей:
 `data`, `items`, `results`, `dialogs`, `chats`.
 
+Если endpoint не передан явно (используется значение по умолчанию), то при `404` скрипт
+автоматически пробует несколько типовых путей (`/chats`, `/chat`, `/dialogs`, ...).
+Если ни один не подходит, используйте явный `--endpoint`.
+
+Если API использует другой формат авторизации, примеры:
+
+```bash
+# Заголовок X-API-Key без Bearer
+python radist_dialogs.py --token "$RADIST_TOKEN" --latest 10 \
+  --auth-header X-API-Key --auth-prefix ""
+
+# Токен как query-параметр
+python radist_dialogs.py --token "$RADIST_TOKEN" --latest 10 \
+  --token-query-param api_key
+```
