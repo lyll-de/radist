@@ -36,6 +36,12 @@ Latest dialogs:
 python radist_dialogs.py --latest 10 --output dialogs.json
 ```
 
+Dialogs by list position:
+
+```bash
+python radist_dialogs.py --index-range --from-index 500 --to-index 1000 --output dialogs_500_1000.json
+```
+
 Dialogs active in a UTC date range:
 
 ```bash
@@ -69,4 +75,6 @@ Each exported item contains:
 - `--format jsonl|json`
 - `--limit` to control page size for chats and messages
 - `--timeout` to change HTTP timeout
+- `--retry-count` and `--retry-backoff` to be more resilient to `429 Too Many Requests`
+- `--index-range --from-index N --to-index M` to export a slice of the dialogs list
 - `--chats-endpoint` and `--messages-endpoint` if Radist changes path templates later

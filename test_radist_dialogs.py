@@ -15,6 +15,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(cfg.auth_header, "X-Api-Key")
         self.assertEqual(cfg.auth_prefix, "")
 
+    def test_parse_index_range(self):
+        cfg = parse_args(
+            [
+                "--token",
+                "t",
+                "--company-id",
+                "163146",
+                "--index-range",
+                "--from-index",
+                "500",
+                "--to-index",
+                "1000",
+            ]
+        )
+        self.assertEqual(cfg.mode, "index_range")
+        self.assertEqual(cfg.from_index, 500)
+        self.assertEqual(cfg.to_index, 1000)
+
     def test_parse_setup_only(self):
         cfg = parse_args(["--token", "t", "--company-id", "163146", "--save-config"])
         self.assertTrue(cfg.setup_only)
@@ -57,6 +75,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(dialogs[0]["contact"]["contact_name"], "Alice")
         self.assertEqual(dialogs[0]["chat"]["chat_id"], 10)
 
+    def test_select_dialog_slice_for_index_range(self):
+        cfg = parse_args(
+            [
+                "--token",
+                "t",
+                "--company-id",
+                "163146",
+                "--index-range",
+                "--from-index",
+                "2",
+                "--to-index",
+                "3",
+            ]
+        )
+        dialogs = [{"chat": {"chat_id": 1}}, {"chat": {"chat_id": 2}}, {"chat": {"chat_id": 3}}]
+        sliced = radist_dialogs.select_dialog_slice(cfg, dialogs)
+        self.assertEqual([item["chat"]["chat_id"] for item in sliced], [2, 3])
+
     def test_resolve_company_id_from_single_company(self):
         cfg = parse_args(["--token", "t", "--latest", "1"])
         original = radist_dialogs.fetch_json
@@ -83,6 +119,22 @@ class CliTests(unittest.TestCase):
                 radist_dialogs.resolve_company_id(cfg)
         finally:
             radist_dialogs.fetch_json = original
+
+    def test_target_dialog_count_for_index_range(self):
+        cfg = parse_args(
+            [
+                "--token",
+                "t",
+                "--company-id",
+                "163146",
+                "--index-range",
+                "--from-index",
+                "500",
+                "--to-index",
+                "1000",
+            ]
+        )
+        self.assertEqual(radist_dialogs.target_dialog_count(cfg), 1000)
 
 
 if __name__ == "__main__":

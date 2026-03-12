@@ -6,10 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.error import HTTPError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -44,6 +45,8 @@ class CliConfig:
     company_id: Optional[int]
     mode: Optional[str]
     latest: Optional[int]
+    from_index: Optional[int]
+    to_index: Optional[int]
     date_from: Optional[str]
     date_to: Optional[str]
     base_url: str
@@ -58,6 +61,8 @@ class CliConfig:
     config_path: Path
     save_config: bool
     setup_only: bool
+    retry_count: int
+    retry_backoff: float
 
 
 def get_config_path(argv: Optional[List[str]] = None) -> Path:
@@ -113,11 +118,18 @@ def build_parser(defaults: Dict[str, Any], config_path: Path) -> argparse.Argume
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--latest", type=int, help="Download latest N dialogs")
     group.add_argument(
+        "--index-range",
+        action="store_true",
+        help="Download dialogs by 1-based index range using --from-index and --to-index",
+    )
+    group.add_argument(
         "--date-range",
         action="store_true",
         help="Download dialogs between --from-date and --to-date",
     )
 
+    parser.add_argument("--from-index", type=int, help="1-based start index for index-range mode")
+    parser.add_argument("--to-index", type=int, help="1-based end index for index-range mode")
     parser.add_argument("--from-date", dest="date_from", help="UTC start date: YYYY-MM-DD")
     parser.add_argument("--to-date", dest="date_to", help="UTC end date: YYYY-MM-DD")
 
@@ -134,6 +146,18 @@ def build_parser(defaults: Dict[str, Any], config_path: Path) -> argparse.Argume
     )
     parser.add_argument("--limit", type=int, default=int(defaults.get("limit", 100)))
     parser.add_argument("--timeout", type=int, default=int(defaults.get("timeout", 30)))
+    parser.add_argument(
+        "--retry-count",
+        type=int,
+        default=int(defaults.get("retry_count", 4)),
+        help="How many times to retry requests on 429 responses",
+    )
+    parser.add_argument(
+        "--retry-backoff",
+        type=float,
+        default=float(defaults.get("retry_backoff", 2.0)),
+        help="Base wait time in seconds for 429 retries",
+    )
     parser.add_argument("--output", default="dialogs.jsonl", help="Output file path")
     parser.add_argument(
         "--format",
@@ -163,8 +187,16 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
 
     if ns.latest is not None and ns.latest <= 0:
         parser.error("--latest must be > 0")
+    if ns.from_index is not None and ns.from_index <= 0:
+        parser.error("--from-index must be > 0")
+    if ns.to_index is not None and ns.to_index <= 0:
+        parser.error("--to-index must be > 0")
     if ns.limit <= 0:
         parser.error("--limit must be > 0")
+    if ns.retry_count < 0:
+        parser.error("--retry-count must be >= 0")
+    if ns.retry_backoff <= 0:
+        parser.error("--retry-backoff must be > 0")
 
     if not ns.token:
         parser.error("--token is required unless saved in the config file")
@@ -177,9 +209,25 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
         if ns.date_from > ns.date_to:
             parser.error("--from-date must be <= --to-date")
         mode = "date_range"
+    elif ns.index_range:
+        if ns.from_index is None or ns.to_index is None:
+            parser.error("--index-range requires both --from-index and --to-index")
+        if ns.from_index > ns.to_index:
+            parser.error("--from-index must be <= --to-index")
+        if ns.date_from or ns.date_to:
+            parser.error("--from-date/--to-date are only valid with --date-range")
+        mode = "index_range"
     elif ns.latest is not None:
+        if ns.from_index is not None or ns.to_index is not None:
+            parser.error("--from-index/--to-index are only valid with --index-range")
+        if ns.date_from or ns.date_to:
+            parser.error("--from-date/--to-date are only valid with --date-range")
         mode = "latest"
     else:
+        if ns.from_index is not None or ns.to_index is not None:
+            parser.error("--from-index/--to-index require --index-range")
+        if ns.date_from or ns.date_to:
+            parser.error("--from-date/--to-date are only valid with --date-range")
         mode = None
 
     setup_only = bool(ns.save_config and mode is None)
@@ -191,6 +239,8 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
         company_id=ns.company_id,
         mode=mode,
         latest=ns.latest,
+        from_index=ns.from_index,
+        to_index=ns.to_index,
         date_from=ns.date_from,
         date_to=ns.date_to,
         base_url=ns.base_url.rstrip("/"),
@@ -205,6 +255,8 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
         config_path=Path(ns.config).expanduser(),
         save_config=ns.save_config,
         setup_only=setup_only,
+        retry_count=ns.retry_count,
+        retry_backoff=ns.retry_backoff,
     )
 
 
@@ -255,19 +307,24 @@ def fetch_json(url: str, config: CliConfig) -> Any:
         "Accept": "application/json",
     }
     req = Request(url, headers=headers)
-    try:
-        with urlopen(req, timeout=config.timeout) as resp:
-            payload = resp.read().decode("utf-8")
-            return json.loads(payload)
-    except HTTPError as exc:
-        body = ""
+    for attempt in range(config.retry_count + 1):
         try:
-            body = exc.read().decode("utf-8", errors="replace")
-        except Exception:
+            with urlopen(req, timeout=config.timeout) as resp:
+                payload = resp.read().decode("utf-8")
+                return json.loads(payload)
+        except HTTPError as exc:
             body = ""
-        raise HttpStatusError(status_code=exc.code, url=url, body=body) from exc
-    except Exception as exc:
-        raise ApiError(f"Request failed for {url}: {exc}") from exc
+            try:
+                body = exc.read().decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+            if exc.code == 429 and attempt < config.retry_count:
+                time.sleep(config.retry_backoff * (2**attempt))
+                continue
+            raise HttpStatusError(status_code=exc.code, url=url, body=body) from exc
+        except Exception as exc:
+            raise ApiError(f"Request failed for {url}: {exc}") from exc
+    raise ApiError(f"Request failed for {url}: exhausted retries")
 
 
 def render_endpoint(template: str, company_id: int) -> str:
@@ -285,6 +342,8 @@ def save_local_config(config: CliConfig) -> None:
         "auth_prefix": config.auth_prefix,
         "limit": config.limit,
         "timeout": config.timeout,
+        "retry_count": config.retry_count,
+        "retry_backoff": config.retry_backoff,
     }
     config.config_path.parent.mkdir(parents=True, exist_ok=True)
     config.config_path.write_text(
@@ -371,10 +430,29 @@ def dialog_sort_key(dialog: Dict[str, Any]) -> str:
     return ""
 
 
+def select_dialog_slice(config: CliConfig, dialogs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if config.mode == "latest":
+        return dialogs[: config.latest]
+    if config.mode == "index_range":
+        start = (config.from_index or 1) - 1
+        end = config.to_index or len(dialogs)
+        return dialogs[start:end]
+    return dialogs
+
+
+def target_dialog_count(config: CliConfig) -> Optional[int]:
+    if config.mode == "latest":
+        return config.latest
+    if config.mode == "index_range":
+        return config.to_index
+    return None
+
+
 def list_dialogs(config: CliConfig, company_id: int) -> List[Dict[str, Any]]:
     dialogs: List[Dict[str, Any]] = []
     cursor: Optional[str] = None
     range_start = None
+    target_count = target_dialog_count(config)
     if config.mode == "date_range" and config.date_from and config.date_to:
         range_start, _ = utc_range_inclusive(config.date_from, config.date_to)
 
@@ -386,7 +464,7 @@ def list_dialogs(config: CliConfig, company_id: int) -> List[Dict[str, Any]]:
 
         dialogs.extend(page_dialogs)
 
-        if config.mode == "latest" and len(dialogs) >= (config.latest or 0):
+        if target_count is not None and len(dialogs) >= target_count:
             break
 
         metadata = payload.get("response_metadata")
@@ -403,9 +481,7 @@ def list_dialogs(config: CliConfig, company_id: int) -> List[Dict[str, Any]]:
         cursor = str(next_cursor)
 
     dialogs.sort(key=dialog_sort_key, reverse=True)
-    if config.mode == "latest":
-        return dialogs[: config.latest]
-    return dialogs
+    return select_dialog_slice(config, dialogs)
 
 
 def fetch_chat_messages(
@@ -417,7 +493,7 @@ def fetch_chat_messages(
 ) -> List[Dict[str, Any]]:
     endpoint = render_endpoint(config.messages_endpoint, company_id)
     messages: List[Dict[str, Any]] = []
-    seen_ids = set()
+    seen_ids: Set[Any] = set()
     until = date_to
 
     while True:
