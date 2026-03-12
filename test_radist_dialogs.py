@@ -1,75 +1,88 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 import radist_dialogs
-from radist_dialogs import ApiError, parse_args, utc_range_inclusive, extract_items, build_auth_value
+from radist_dialogs import ApiError, build_auth_value, parse_args, utc_range_inclusive
 
 
 class CliTests(unittest.TestCase):
     def test_parse_latest(self):
-        cfg = parse_args(["--token", "t", "--latest", "5"])
+        cfg = parse_args(["--token", "t", "--company-id", "163146", "--latest", "5"])
         self.assertEqual(cfg.mode, "latest")
         self.assertEqual(cfg.latest, 5)
-        self.assertEqual(cfg.auth_header, "Authorization")
-        self.assertEqual(cfg.auth_prefix, "Bearer")
+        self.assertEqual(cfg.company_id, 163146)
+        self.assertEqual(cfg.auth_header, "X-Api-Key")
+        self.assertEqual(cfg.auth_prefix, "")
 
-    def test_parse_date_range(self):
-        cfg = parse_args(
-            [
-                "--token",
-                "t",
-                "--date-range",
-                "--from-date",
-                "2026-01-01",
-                "--to-date",
-                "2026-01-10",
-            ]
-        )
-        self.assertEqual(cfg.mode, "date_range")
+    def test_parse_setup_only(self):
+        cfg = parse_args(["--token", "t", "--company-id", "163146", "--save-config"])
+        self.assertTrue(cfg.setup_only)
+        self.assertIsNone(cfg.mode)
+
+    def test_parse_uses_saved_config(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "radist.json"
+            config_path.write_text(
+                '{"token":"saved","company_id":163146,"auth_header":"X-Api-Key","auth_prefix":""}',
+                encoding="utf-8",
+            )
+            cfg = parse_args(["--config", str(config_path), "--latest", "1"])
+            self.assertEqual(cfg.token, "saved")
+            self.assertEqual(cfg.company_id, 163146)
+            self.assertEqual(cfg.latest, 1)
 
     def test_utc_range_is_inclusive(self):
         start, end = utc_range_inclusive("2026-01-01", "2026-01-02")
         self.assertEqual(start, "2026-01-01T00:00:00Z")
         self.assertTrue(end.startswith("2026-01-02T23:59:59"))
 
-    def test_extract_items(self):
-        payload = {"data": [{"id": 1}, {"id": 2}]}
-        self.assertEqual(len(extract_items(payload)), 2)
-
     def test_build_auth_value(self):
         self.assertEqual(build_auth_value("Bearer", "abc"), "Bearer abc")
         self.assertEqual(build_auth_value("", "abc"), "abc")
 
-    def test_endpoint_autodetection_uses_first_working_candidate(self):
-        cfg = parse_args(["--token", "t", "--latest", "1"])
+    def test_flatten_chats(self):
+        payload = {
+            "data": [
+                {
+                    "contact_id": 1,
+                    "contact_name": "Alice",
+                    "last_chat_updated_at": "2026-03-01T10:00:00Z",
+                    "chats": [{"chat_id": 10, "name": "Chat A", "unanswered_count": 0}],
+                }
+            ]
+        }
+        dialogs = radist_dialogs.flatten_chats(payload)
+        self.assertEqual(len(dialogs), 1)
+        self.assertEqual(dialogs[0]["contact"]["contact_name"], "Alice")
+        self.assertEqual(dialogs[0]["chat"]["chat_id"], 10)
 
-        original = radist_dialogs.fetch_page
+    def test_resolve_company_id_from_single_company(self):
+        cfg = parse_args(["--token", "t", "--latest", "1"])
+        original = radist_dialogs.fetch_json
 
         def fake_fetch(url, config):
-            if "/chat?" in url:
-                return {"data": []}
-            if "/chats?" in url:
-                raise radist_dialogs.HttpStatusError(status_code=404, url=url, body="")
-            raise ApiError("unexpected")
+            return {"companies": [{"id": 163146, "name": "Only"}]}
 
-        radist_dialogs.fetch_page = fake_fetch
+        radist_dialogs.fetch_json = fake_fetch
         try:
-            self.assertEqual(radist_dialogs.resolve_endpoint(cfg), "/chat")
+            self.assertEqual(radist_dialogs.resolve_company_id(cfg), 163146)
         finally:
-            radist_dialogs.fetch_page = original
+            radist_dialogs.fetch_json = original
 
-    def test_endpoint_autodetection_fails_with_hint(self):
+    def test_resolve_company_id_requires_explicit_when_multiple(self):
         cfg = parse_args(["--token", "t", "--latest", "1"])
-        original = radist_dialogs.fetch_page
+        original = radist_dialogs.fetch_json
 
         def fake_fetch(url, config):
-            raise radist_dialogs.HttpStatusError(status_code=404, url=url, body="")
+            return {"companies": [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]}
 
-        radist_dialogs.fetch_page = fake_fetch
+        radist_dialogs.fetch_json = fake_fetch
         try:
             with self.assertRaises(ApiError):
-                radist_dialogs.resolve_endpoint(cfg)
+                radist_dialogs.resolve_company_id(cfg)
         finally:
-            radist_dialogs.fetch_page = original
+            radist_dialogs.fetch_json = original
 
 
 if __name__ == "__main__":

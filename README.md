@@ -1,71 +1,72 @@
-# Radist dialogs downloader (CLI)
+# Radist dialogs downloader
 
-Простой Python-скрипт для скачивания диалогов из Radist API в двух режимах:
+Python CLI for exporting dialogs from the Radist Messaging API.
 
-- последние `N` диалогов;
-- диалоги за диапазон дат (`UTC`, включительно).
+The script now uses the documented v2 endpoints:
 
-## Быстрый старт
+- `GET /companies/{company_id}/messaging/chats/with_contacts/`
+- `GET /companies/{company_id}/messaging/messages/`
+
+Auth defaults match the OpenAPI schema:
+
+- header: `X-Api-Key`
+- token prefix: empty
+
+## One-time setup
+
+Save your token and `company_id` locally:
 
 ```bash
-python radist_dialogs.py --token "$RADIST_TOKEN" --latest 50 --output dialogs.jsonl
+python radist_dialogs.py --token "$RADIST_TOKEN" --company-id 163146 --save-config
 ```
+
+By default the config is stored in:
+
+```text
+~/.radist_dialogs.json
+```
+
+After that you can run the downloader without repeating auth args.
+
+## Examples
+
+Latest dialogs:
+
+```bash
+python radist_dialogs.py --latest 10 --output dialogs.json
+```
+
+Dialogs active in a UTC date range:
+
+```bash
+python radist_dialogs.py \
+  --date-range --from-date 2026-03-01 --to-date 2026-03-10 \
+  --output dialogs.json
+```
+
+Save config and download in one command:
 
 ```bash
 python radist_dialogs.py \
   --token "$RADIST_TOKEN" \
-  --date-range --from-date 2026-01-01 --to-date 2026-01-31 \
-  --output january_dialogs.jsonl
+  --company-id 163146 \
+  --save-config \
+  --latest 10
 ```
 
-## Форматы вывода
+## Output shape
 
-- `jsonl` (по умолчанию): по одному диалогу на строку — удобно читать и обрабатывать частями.
-- `json`: один массив JSON — удобно открыть целиком в редакторе.
+Each exported item contains:
 
-Выбор через `--format jsonl|json`.
+- `company_id`
+- `contact`
+- `chat`
+- `messages`
 
-## Параметры
+## Useful flags
 
-- `--token` (обязательный): API токен.
-- Режимы (взаимоисключающие):
-  - `--latest N`
-  - `--date-range --from-date YYYY-MM-DD --to-date YYYY-MM-DD`
-- `--output` путь к файлу (по умолчанию `dialogs.jsonl`)
-- `--endpoint` путь endpoint (по умолчанию `/chats`)
-- `--base-url` базовый URL API (по умолчанию `https://api.radist.online/v2`)
-- `--limit` размер страницы (по умолчанию `100`)
-- `--timeout` таймаут HTTP (по умолчанию `30`)
-- `--auth-header` имя заголовка с токеном (по умолчанию `Authorization`)
-- `--auth-prefix` префикс токена (по умолчанию `Bearer`)
-- `--token-query-param` опционально передаёт токен ещё и в query-параметре (например `api_key`)
-
-### Кастомизация query-параметров
-
-Если в API отличаются имена параметров пагинации/дат, можно задать:
-
-- `--page-param` (по умолчанию `page`)
-- `--limit-param` (по умолчанию `limit`)
-- `--from-param` (по умолчанию `date_from`)
-- `--to-param` (по умолчанию `date_to`)
-
-## Допущения
-
-Так как API может возвращать данные в разных обертках, скрипт пытается извлекать диалоги из ключей:
-`data`, `items`, `results`, `dialogs`, `chats`.
-
-Если endpoint не передан явно (используется значение по умолчанию), то при `404` скрипт
-автоматически пробует несколько типовых путей (`/chats`, `/chat`, `/dialogs`, ...).
-Если ни один не подходит, используйте явный `--endpoint`.
-
-Если API использует другой формат авторизации, примеры:
-
-```bash
-# Заголовок X-API-Key без Bearer
-python radist_dialogs.py --token "$RADIST_TOKEN" --latest 10 \
-  --auth-header X-API-Key --auth-prefix ""
-
-# Токен как query-параметр
-python radist_dialogs.py --token "$RADIST_TOKEN" --latest 10 \
-  --token-query-param api_key
-```
+- `--config PATH` to use a custom local config file
+- `--format jsonl|json`
+- `--limit` to control page size for chats and messages
+- `--timeout` to change HTTP timeout
+- `--chats-endpoint` and `--messages-endpoint` if Radist changes path templates later
