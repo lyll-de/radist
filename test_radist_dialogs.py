@@ -1,9 +1,18 @@
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 import radist_dialogs
-from radist_dialogs import ApiError, build_auth_value, parse_args, utc_range_inclusive
+from radist_dialogs import (
+    ApiError,
+    HttpStatusError,
+    add_token_query_param,
+    build_auth_value,
+    last_days_date_range,
+    parse_args,
+    utc_range_inclusive,
+)
 
 
 class CliTests(unittest.TestCase):
@@ -11,9 +20,23 @@ class CliTests(unittest.TestCase):
         cfg = parse_args(["--token", "t", "--company-id", "163146", "--latest", "5"])
         self.assertEqual(cfg.mode, "latest")
         self.assertEqual(cfg.latest, 5)
+        self.assertIsNone(cfg.last_days)
         self.assertEqual(cfg.company_id, 163146)
         self.assertEqual(cfg.auth_header, "X-Api-Key")
         self.assertEqual(cfg.auth_prefix, "")
+        self.assertIsNone(cfg.token_query_param)
+
+    def test_parse_last_days(self):
+        cfg = parse_args(["--token", "t", "--company-id", "163146", "--last-days", "10"])
+        self.assertEqual(cfg.mode, "date_range")
+        self.assertEqual(cfg.last_days, 10)
+        self.assertRegex(cfg.date_from, r"^\d{4}-\d{2}-\d{2}$")
+        self.assertRegex(cfg.date_to, r"^\d{4}-\d{2}-\d{2}$")
+
+    def test_last_days_date_range_includes_today(self):
+        start, end = last_days_date_range(10, today=date(2026, 5, 22))
+        self.assertEqual(start, "2026-05-13")
+        self.assertEqual(end, "2026-05-22")
 
     def test_parse_index_range(self):
         cfg = parse_args(
@@ -58,6 +81,22 @@ class CliTests(unittest.TestCase):
     def test_build_auth_value(self):
         self.assertEqual(build_auth_value("Bearer", "abc"), "Bearer abc")
         self.assertEqual(build_auth_value("", "abc"), "abc")
+
+    def test_add_token_query_param(self):
+        cfg = parse_args(
+            [
+                "--token",
+                "abc",
+                "--company-id",
+                "163146",
+                "--latest",
+                "1",
+                "--token-query-param",
+                "api_key",
+            ]
+        )
+        url = add_token_query_param("https://example.test/path?limit=1", cfg)
+        self.assertEqual(url, "https://example.test/path?limit=1&api_key=abc")
 
     def test_flatten_chats(self):
         payload = {
@@ -135,6 +174,55 @@ class CliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(radist_dialogs.target_dialog_count(cfg), 1000)
+
+    def test_auto_detect_endpoints_uses_first_working_candidates(self):
+        cfg = parse_args(
+            [
+                "--token",
+                "t",
+                "--company-id",
+                "163146",
+                "--latest",
+                "1",
+                "--chats-endpoint",
+                "/companies/{company_id}/wrong/chats/",
+                "--messages-endpoint",
+                "/companies/{company_id}/wrong/messages/",
+            ]
+        )
+        original = radist_dialogs.fetch_json
+        calls = []
+
+        def fake_fetch(url, config):
+            calls.append(url)
+            if "/wrong/" in url:
+                raise HttpStatusError(404, url, "not found")
+            if "/messaging/chats/with_contacts/" in url:
+                return {
+                    "data": [
+                        {
+                            "contact_id": 1,
+                            "contact_name": "Alice",
+                            "chats": [{"chat_id": 10}],
+                        }
+                    ]
+                }
+            if "/messaging/messages/" in url:
+                return []
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        radist_dialogs.fetch_json = fake_fetch
+        try:
+            radist_dialogs.auto_detect_endpoints(cfg)
+        finally:
+            radist_dialogs.fetch_json = original
+
+        self.assertEqual(
+            cfg.chats_endpoint,
+            "/companies/{company_id}/messaging/chats/with_contacts/",
+        )
+        self.assertEqual(cfg.messages_endpoint, "/companies/{company_id}/messaging/messages/")
+        self.assertGreaterEqual(len(calls), 4)
 
 
 if __name__ == "__main__":

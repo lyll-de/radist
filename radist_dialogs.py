@@ -8,11 +8,11 @@ import json
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from urllib.error import HTTPError
-from urllib.parse import urlencode
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 
@@ -20,6 +20,15 @@ DEFAULT_BASE_URL = "https://api.radist.online/v2"
 DEFAULT_CHATS_ENDPOINT = "/companies/{company_id}/messaging/chats/with_contacts/"
 DEFAULT_MESSAGES_ENDPOINT = "/companies/{company_id}/messaging/messages/"
 DEFAULT_CONFIG_PATH = Path.home() / ".radist_dialogs.json"
+DEFAULT_CHATS_ENDPOINT_CANDIDATES = (
+    DEFAULT_CHATS_ENDPOINT,
+    "/companies/{company_id}/messaging/chats/",
+)
+DEFAULT_MESSAGES_ENDPOINT_CANDIDATES = (
+    DEFAULT_MESSAGES_ENDPOINT,
+    "/companies/{company_id}/messaging/messages/",
+)
+AUTH_ERROR_CODES = {401, 403}
 
 
 class ApiError(RuntimeError):
@@ -45,6 +54,7 @@ class CliConfig:
     company_id: Optional[int]
     mode: Optional[str]
     latest: Optional[int]
+    last_days: Optional[int]
     from_index: Optional[int]
     to_index: Optional[int]
     date_from: Optional[str]
@@ -58,6 +68,7 @@ class CliConfig:
     output_format: str
     auth_header: str
     auth_prefix: str
+    token_query_param: Optional[str]
     config_path: Path
     save_config: bool
     setup_only: bool
@@ -118,6 +129,11 @@ def build_parser(defaults: Dict[str, Any], config_path: Path) -> argparse.Argume
     group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--latest", type=int, help="Download latest N dialogs")
     group.add_argument(
+        "--last-days",
+        type=int,
+        help="Download dialogs active in the last N UTC calendar days, including today",
+    )
+    group.add_argument(
         "--index-range",
         action="store_true",
         help="Download dialogs by 1-based index range using --from-index and --to-index",
@@ -176,6 +192,11 @@ def build_parser(defaults: Dict[str, Any], config_path: Path) -> argparse.Argume
         default=defaults.get("auth_prefix", ""),
         help="Prefix before token in auth header. Empty means raw token.",
     )
+    parser.add_argument(
+        "--token-query-param",
+        default=defaults.get("token_query_param"),
+        help="Query parameter name for API token. If set, token is sent in the URL instead of a header.",
+    )
     return parser
 
 
@@ -187,6 +208,8 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
 
     if ns.latest is not None and ns.latest <= 0:
         parser.error("--latest must be > 0")
+    if ns.last_days is not None and ns.last_days <= 0:
+        parser.error("--last-days must be > 0")
     if ns.from_index is not None and ns.from_index <= 0:
         parser.error("--from-index must be > 0")
     if ns.to_index is not None and ns.to_index <= 0:
@@ -208,6 +231,13 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
         validate_date(ns.date_to)
         if ns.date_from > ns.date_to:
             parser.error("--from-date must be <= --to-date")
+        mode = "date_range"
+    elif ns.last_days is not None:
+        if ns.from_index is not None or ns.to_index is not None:
+            parser.error("--from-index/--to-index are only valid with --index-range")
+        if ns.date_from or ns.date_to:
+            parser.error("--from-date/--to-date are only valid with --date-range")
+        ns.date_from, ns.date_to = last_days_date_range(ns.last_days)
         mode = "date_range"
     elif ns.index_range:
         if ns.from_index is None or ns.to_index is None:
@@ -232,13 +262,17 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
 
     setup_only = bool(ns.save_config and mode is None)
     if mode is None and not setup_only:
-        parser.error("Specify either --latest or --date-range, or use --save-config to store defaults")
+        parser.error(
+            "Specify either --latest, --last-days, or --date-range, "
+            "or use --save-config to store defaults"
+        )
 
     return CliConfig(
         token=ns.token,
         company_id=ns.company_id,
         mode=mode,
         latest=ns.latest,
+        last_days=ns.last_days,
         from_index=ns.from_index,
         to_index=ns.to_index,
         date_from=ns.date_from,
@@ -252,6 +286,7 @@ def parse_args(argv: Optional[List[str]] = None) -> CliConfig:
         output_format=ns.output_format,
         auth_header=ns.auth_header,
         auth_prefix=ns.auth_prefix,
+        token_query_param=ns.token_query_param,
         config_path=Path(ns.config).expanduser(),
         save_config=ns.save_config,
         setup_only=setup_only,
@@ -269,6 +304,12 @@ def normalize_endpoint(endpoint: str) -> str:
 
 def validate_date(value: str) -> None:
     datetime.strptime(value, "%Y-%m-%d")
+
+
+def last_days_date_range(days: int, today: Optional[date] = None) -> Tuple[str, str]:
+    end = today or datetime.now(timezone.utc).date()
+    start = end - timedelta(days=days - 1)
+    return start.isoformat(), end.isoformat()
 
 
 def utc_range_inclusive(start: str, end: str) -> Tuple[str, str]:
@@ -294,6 +335,19 @@ def build_url(base_url: str, endpoint: str, params: Dict[str, Any]) -> str:
     return f"{base_url}{endpoint}?{query}" if query else f"{base_url}{endpoint}"
 
 
+def add_query_params(url: str, params: Dict[str, Any]) -> str:
+    filtered = {k: v for k, v in params.items() if v is not None and v != ""}
+    if not filtered:
+        return url
+
+    parts = urlsplit(url)
+    query_items = parse_qsl(parts.query, keep_blank_values=True)
+    query_items.extend((key, str(value)) for key, value in filtered.items())
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query_items), parts.fragment)
+    )
+
+
 def build_auth_value(prefix: str, token: str) -> str:
     normalized = prefix.strip()
     if not normalized:
@@ -301,12 +355,34 @@ def build_auth_value(prefix: str, token: str) -> str:
     return f"{normalized} {token}"
 
 
+def build_headers(config: CliConfig) -> Dict[str, str]:
+    headers = {"Accept": "application/json"}
+    if not config.token_query_param and config.auth_header:
+        headers[config.auth_header] = build_auth_value(config.auth_prefix, config.token)
+    return headers
+
+
+def add_token_query_param(url: str, config: CliConfig) -> str:
+    if not config.token_query_param:
+        return url
+    return add_query_params(url, {config.token_query_param: config.token})
+
+
+def redact_url(url: str, config: CliConfig) -> str:
+    if not config.token_query_param:
+        return url
+
+    parts = urlsplit(url)
+    redacted = [
+        (key, "<redacted>" if key == config.token_query_param else value)
+        for key, value in parse_qsl(parts.query, keep_blank_values=True)
+    ]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted), parts.fragment))
+
+
 def fetch_json(url: str, config: CliConfig) -> Any:
-    headers = {
-        config.auth_header: build_auth_value(config.auth_prefix, config.token),
-        "Accept": "application/json",
-    }
-    req = Request(url, headers=headers)
+    request_url = add_token_query_param(url, config)
+    req = Request(request_url, headers=build_headers(config))
     for attempt in range(config.retry_count + 1):
         try:
             with urlopen(req, timeout=config.timeout) as resp:
@@ -321,10 +397,14 @@ def fetch_json(url: str, config: CliConfig) -> Any:
             if exc.code == 429 and attempt < config.retry_count:
                 time.sleep(config.retry_backoff * (2**attempt))
                 continue
-            raise HttpStatusError(status_code=exc.code, url=url, body=body) from exc
+            raise HttpStatusError(
+                status_code=exc.code,
+                url=redact_url(request_url, config),
+                body=body,
+            ) from exc
         except Exception as exc:
-            raise ApiError(f"Request failed for {url}: {exc}") from exc
-    raise ApiError(f"Request failed for {url}: exhausted retries")
+            raise ApiError(f"Request failed for {redact_url(request_url, config)}: {exc}") from exc
+    raise ApiError(f"Request failed for {redact_url(request_url, config)}: exhausted retries")
 
 
 def render_endpoint(template: str, company_id: int) -> str:
@@ -340,6 +420,7 @@ def save_local_config(config: CliConfig) -> None:
         "messages_endpoint": config.messages_endpoint,
         "auth_header": config.auth_header,
         "auth_prefix": config.auth_prefix,
+        "token_query_param": config.token_query_param,
         "limit": config.limit,
         "timeout": config.timeout,
         "retry_count": config.retry_count,
@@ -349,6 +430,93 @@ def save_local_config(config: CliConfig) -> None:
     config.config_path.write_text(
         json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
     )
+
+
+def endpoint_candidates(primary: str, fallbacks: Tuple[str, ...]) -> List[str]:
+    candidates: List[str] = []
+    for endpoint in (primary, *fallbacks):
+        normalized = normalize_endpoint(endpoint)
+        if normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
+
+
+def summarize_endpoint_errors(errors: List[str]) -> str:
+    if not errors:
+        return "no endpoint candidates were checked"
+    return "; ".join(errors[:5])
+
+
+def find_first_chat_id(payload: Dict[str, Any]) -> Optional[int]:
+    for dialog in flatten_chats(payload):
+        chat = dialog.get("chat", {})
+        if isinstance(chat, dict) and chat.get("chat_id") is not None:
+            return int(chat["chat_id"])
+    return None
+
+
+def detect_chats_endpoint(config: CliConfig, company_id: int) -> Tuple[str, Dict[str, Any]]:
+    errors: List[str] = []
+    for endpoint in endpoint_candidates(config.chats_endpoint, DEFAULT_CHATS_ENDPOINT_CANDIDATES):
+        url = build_url(config.base_url, render_endpoint(endpoint, company_id), {"limit": 1})
+        try:
+            payload = fetch_json(url, config)
+        except HttpStatusError as exc:
+            if exc.status_code in AUTH_ERROR_CODES:
+                raise
+            errors.append(f"{endpoint} -> HTTP {exc.status_code}")
+            continue
+        except ApiError as exc:
+            errors.append(f"{endpoint} -> {exc}")
+            continue
+
+        if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            return endpoint, payload
+        errors.append(f"{endpoint} -> unexpected response shape")
+
+    raise ApiError(f"Could not auto-detect chats endpoint: {summarize_endpoint_errors(errors)}")
+
+
+def detect_messages_endpoint(config: CliConfig, company_id: int, chat_id: int) -> str:
+    errors: List[str] = []
+    for endpoint in endpoint_candidates(
+        config.messages_endpoint, DEFAULT_MESSAGES_ENDPOINT_CANDIDATES
+    ):
+        url = build_url(
+            config.base_url,
+            render_endpoint(endpoint, company_id),
+            {"chat_id": chat_id, "limit": 1},
+        )
+        try:
+            payload = fetch_json(url, config)
+        except HttpStatusError as exc:
+            if exc.status_code in AUTH_ERROR_CODES:
+                raise
+            errors.append(f"{endpoint} -> HTTP {exc.status_code}")
+            continue
+        except ApiError as exc:
+            errors.append(f"{endpoint} -> {exc}")
+            continue
+
+        if isinstance(payload, list):
+            return endpoint
+        errors.append(f"{endpoint} -> unexpected response shape")
+
+    raise ApiError(f"Could not auto-detect messages endpoint: {summarize_endpoint_errors(errors)}")
+
+
+def auto_detect_endpoints(config: CliConfig) -> None:
+    if config.company_id is None:
+        raise ApiError("Could not auto-detect endpoints without company_id")
+
+    chats_endpoint, chats_payload = detect_chats_endpoint(config, config.company_id)
+    config.chats_endpoint = chats_endpoint
+
+    first_chat_id = find_first_chat_id(chats_payload)
+    if first_chat_id is not None:
+        config.messages_endpoint = detect_messages_endpoint(
+            config, config.company_id, first_chat_id
+        )
 
 
 def resolve_company_id(config: CliConfig) -> int:
@@ -608,6 +776,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         config = parse_args(argv)
         config.company_id = resolve_company_id(config)
+        auto_detect_endpoints(config)
 
         if config.save_config:
             save_local_config(config)
