@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -380,6 +381,15 @@ def redact_url(url: str, config: CliConfig) -> str:
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(redacted), parts.fragment))
 
 
+def redact_error_body(body: str, config: CliConfig) -> str:
+    if not body or not config.token_query_param:
+        return body
+
+    redacted = body.replace(config.token, "<redacted>")
+    pattern = re.compile(rf"({re.escape(config.token_query_param)}=)[^&\s'\"<>]+")
+    return pattern.sub(r"\1<redacted>", redacted)
+
+
 def fetch_json(url: str, config: CliConfig) -> Any:
     request_url = add_token_query_param(url, config)
     req = Request(request_url, headers=build_headers(config))
@@ -400,7 +410,7 @@ def fetch_json(url: str, config: CliConfig) -> Any:
             raise HttpStatusError(
                 status_code=exc.code,
                 url=redact_url(request_url, config),
-                body=body,
+                body=redact_error_body(body, config),
             ) from exc
         except Exception as exc:
             raise ApiError(f"Request failed for {redact_url(request_url, config)}: {exc}") from exc
@@ -776,13 +786,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         config = parse_args(argv)
         config.company_id = resolve_company_id(config)
+
+        if config.save_config and config.setup_only:
+            save_local_config(config)
+            print(f"Saved config -> {config.config_path}")
+            return 0
+
         auto_detect_endpoints(config)
 
         if config.save_config:
             save_local_config(config)
-            if config.setup_only:
-                print(f"Saved config -> {config.config_path}")
-                return 0
 
         dialogs = download_dialogs(config)
         save_dialogs(dialogs, config.output, config.output_format)

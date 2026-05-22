@@ -1,3 +1,5 @@
+import contextlib
+import io
 import tempfile
 import unittest
 from datetime import date
@@ -97,6 +99,52 @@ class CliTests(unittest.TestCase):
         )
         url = add_token_query_param("https://example.test/path?limit=1", cfg)
         self.assertEqual(url, "https://example.test/path?limit=1&api_key=abc")
+
+    def test_redact_error_body_for_query_token(self):
+        cfg = parse_args(
+            [
+                "--token",
+                "secret-token",
+                "--company-id",
+                "163146",
+                "--latest",
+                "1",
+                "--token-query-param",
+                "api_key",
+            ]
+        )
+        body = "failed URL https://example.test/path?api_key=secret-token&limit=1 secret-token"
+        redacted = radist_dialogs.redact_error_body(body, cfg)
+        self.assertNotIn("secret-token", redacted)
+        self.assertIn("api_key=<redacted>", redacted)
+
+    def test_setup_only_skips_endpoint_detection(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "radist.json"
+            original = radist_dialogs.auto_detect_endpoints
+
+            def fail_auto_detect(config):
+                raise AssertionError("setup-only should not probe endpoints")
+
+            radist_dialogs.auto_detect_endpoints = fail_auto_detect
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    code = radist_dialogs.main(
+                        [
+                            "--token",
+                            "t",
+                            "--company-id",
+                            "163146",
+                            "--save-config",
+                            "--config",
+                            str(config_path),
+                        ]
+                    )
+            finally:
+                radist_dialogs.auto_detect_endpoints = original
+
+            self.assertEqual(code, 0)
+            self.assertTrue(config_path.exists())
 
     def test_flatten_chats(self):
         payload = {
